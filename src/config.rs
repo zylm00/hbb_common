@@ -16,6 +16,7 @@ use regex::Regex;
 use serde as de;
 use serde_derive::{Deserialize, Serialize};
 use serde_json;
+use sha2::{Digest, Sha256};
 use sodiumoxide::base64;
 use sodiumoxide::crypto::sign;
 
@@ -40,6 +41,55 @@ pub const COMPRESS_LEVEL: i32 = 3;
 const SERIAL: i32 = 3;
 const PASSWORD_ENC_VERSION: &str = "00";
 pub const ENCRYPT_MAX_LEN: usize = 128; // used for password, pin, etc, not for all
+
+const PERMANENT_PASSWORD_HASH_PREFIX: &str = "01";
+const PERMANENT_PASSWORD_H1_LEN: usize = 32;
+const DEFAULT_SALT_LEN: usize = 6;
+
+fn is_permanent_password_hashed_storage(v: &str) -> bool {
+    decode_permanent_password_h1_from_storage(v).is_some()
+}
+
+pub fn compute_permanent_password_h1(
+    password: &str,
+    salt: &str,
+) -> [u8; PERMANENT_PASSWORD_H1_LEN] {
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    hasher.update(salt.as_bytes());
+    let out = hasher.finalize();
+    let mut h1 = [0u8; PERMANENT_PASSWORD_H1_LEN];
+    h1.copy_from_slice(&out[..PERMANENT_PASSWORD_H1_LEN]);
+    h1
+}
+
+fn constant_time_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    sodiumoxide::utils::memcmp(a, b)
+}
+
+fn encode_permanent_password_storage_from_h1(h1: &[u8; PERMANENT_PASSWORD_H1_LEN]) -> String {
+    PERMANENT_PASSWORD_HASH_PREFIX.to_owned() + &base64::encode(h1, base64::Variant::Original)
+}
+
+pub fn decode_permanent_password_h1_from_storage(
+    storage: &str,
+) -> Option<[u8; PERMANENT_PASSWORD_H1_LEN]> {
+    let encoded = storage.strip_prefix(PERMANENT_PASSWORD_HASH_PREFIX)?;
+
+    let v = base64::decode(encoded.as_bytes(), base64::Variant::Original).ok()?;
+    if v.len() != PERMANENT_PASSWORD_H1_LEN {
+        return None;
+    }
+    let mut h1 = [0u8; PERMANENT_PASSWORD_H1_LEN];
+    h1.copy_from_slice(&v[..PERMANENT_PASSWORD_H1_LEN]);
+    Some(h1)
+}
+
+// If password is empty or not hashed storage, it's safe to update salt.
+fn password_is_empty_or_not_hashed(permanent_password_storage: &str) -> bool {
+    permanent_password_storage.is_empty()
+        || !is_permanent_password_hashed_storage(permanent_password_storage)
+}
 
 #[cfg(target_os = "macos")]
 lazy_static::lazy_static! {
@@ -204,6 +254,29 @@ pub const RENDEZVOUS_PORT: i32 = 21116;
 pub const RELAY_PORT: i32 = 21117;
 pub const WS_RENDEZVOUS_PORT: i32 = 21118;
 pub const WS_RELAY_PORT: i32 = 21119;
+
+#[inline]
+pub fn is_service_ipc_postfix(postfix: &str) -> bool {
+    // `_service` is a protected cross-user IPC channel used by the root service.
+    //
+    // On Linux Wayland, input injection is implemented via uinput in the root service process.
+    // The user `--server` process must be able to connect to these uinput IPC channels, so they
+    // must share the same IPC parent directory as `_service`.
+    postfix == "_service" || postfix.starts_with("_uinput_")
+}
+
+// Keep Linux/macOS IPC parent directory rules in one place to avoid drift between
+// `ipc_path()` and Linux-only `ipc_path_for_uid()`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[inline]
+fn ipc_parent_dir_for_uid(uid: u32, postfix: &str) -> String {
+    let app_name = APP_NAME.read().unwrap().clone();
+    if is_service_ipc_postfix(postfix) {
+        format!("/tmp/{app_name}-service")
+    } else {
+        format!("/tmp/{app_name}-{uid}")
+    }
+}
 
 macro_rules! serde_field_string {
     ($default_func:ident, $de_func:ident, $default_expr:expr) => {
@@ -655,9 +728,7 @@ impl Config {
     fn load() -> Config {
         let mut config = Config::load_::<Config>("");
         let mut store = false;
-        let (password, _, store1) = decrypt_str_or_original(&config.password, PASSWORD_ENC_VERSION);
-        config.password = password;
-        store |= store1;
+        store |= Self::migrate_permanent_password_to_hashed_storage(&mut config);
         let mut id_valid = false;
         let (id, encrypted, store2) = decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
         if encrypted {
@@ -679,6 +750,7 @@ impl Config {
             store = true;
         }
         if !id_valid {
+            log::warn!("ID is invalid, generating new one");
             for _ in 0..3 {
                 if let Some(id) = Config::gen_id() {
                     config.id = id;
@@ -695,10 +767,44 @@ impl Config {
         config
     }
 
+    fn migrate_permanent_password_to_hashed_storage(config: &mut Config) -> bool {
+        if config.password.is_empty() || is_permanent_password_hashed_storage(&config.password) {
+            return false;
+        }
+
+        if config.password.starts_with(PASSWORD_ENC_VERSION) {
+            let (plain, decrypted, looks_like_plaintext) =
+                decrypt_str_or_original(&config.password, PASSWORD_ENC_VERSION);
+            // `decrypt_str_or_original` returns (value, decrypted_ok, should_store).
+            // If the value looks like an encrypted payload ("00" + base64 with MAC) but cannot be
+            // decrypted on this machine, it is most likely copied from another device or corrupted.
+            // In normal single-machine setups this should be extremely rare, so keep it as-is.
+            if !decrypted && !looks_like_plaintext {
+                return false;
+            }
+            if config.salt.is_empty() {
+                config.salt = Config::get_auto_password(DEFAULT_SALT_LEN);
+            }
+            if is_permanent_password_hashed_storage(&plain) {
+                config.password = plain;
+                return true;
+            }
+            let h1 = compute_permanent_password_h1(&plain, &config.salt);
+            config.password = encode_permanent_password_storage_from_h1(&h1);
+            return true;
+        }
+
+        if config.salt.is_empty() {
+            config.salt = Config::get_auto_password(DEFAULT_SALT_LEN);
+        }
+        let h1 = compute_permanent_password_h1(&config.password, &config.salt);
+        config.password = encode_permanent_password_storage_from_h1(&h1);
+        true
+    }
+
     fn store(&self) {
         let mut config = self.clone();
-        config.password =
-            encrypt_str_or_original(&config.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        Self::migrate_permanent_password_to_hashed_storage(&mut config);
         config.enc_id = encrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
         config.id = "".to_owned();
         Config::store_(&config, "");
@@ -825,17 +931,41 @@ impl Config {
         }
         #[cfg(not(windows))]
         {
+            #[cfg(target_os = "android")]
             use std::os::unix::fs::PermissionsExt;
             #[cfg(target_os = "android")]
             let mut path: PathBuf =
                 format!("{}/{}", *APP_DIR.read().unwrap(), *APP_NAME.read().unwrap()).into();
-            #[cfg(not(target_os = "android"))]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let mut path: PathBuf = {
+                let uid = unsafe { libc::geteuid() as u32 };
+                ipc_parent_dir_for_uid(uid, postfix).into()
+            };
+            #[cfg(not(any(target_os = "android", target_os = "linux", target_os = "macos")))]
             let mut path: PathBuf = format!("/tmp/{}", *APP_NAME.read().unwrap()).into();
-            fs::create_dir(&path).ok();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o0777)).ok();
+            // Android stores IPC sockets under app-controlled directories. Create the IPC parent
+            // dir and enforce the expected mode here. On other Unix platforms, `ipc_path()` is
+            // intentionally side-effect free (no mkdir/chmod); callers should enforce directory and
+            // socket permissions at the IPC server boundary.
+            #[cfg(target_os = "android")]
+            {
+                fs::create_dir_all(&path).ok();
+                let path_mode = if is_service_ipc_postfix(postfix) {
+                    0o0711
+                } else {
+                    0o0700
+                };
+                fs::set_permissions(&path, fs::Permissions::from_mode(path_mode)).ok();
+            }
             path.push(format!("ipc{postfix}"));
             path.to_str().unwrap_or("").to_owned()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn ipc_path_for_uid(uid: u32, postfix: &str) -> String {
+        let parent = ipc_parent_dir_for_uid(uid, postfix);
+        format!("{parent}/ipc{postfix}")
     }
 
     pub fn icon_path() -> PathBuf {
@@ -1009,6 +1139,7 @@ impl Config {
                     id = (id << 8) | (*x as u32);
                 }
                 id &= 0x1FFFFFFF;
+                log::info!("Generated id {}", id);
                 Some(id.to_string())
             } else {
                 None
@@ -1081,6 +1212,31 @@ impl Config {
         }
         *lock = Some(config.key_pair.clone());
         config.key_pair
+    }
+
+    pub fn get_cached_pk() -> Option<Vec<u8>> {
+        KEY_PAIR.lock().unwrap().clone().map(|k| k.1)
+    }
+
+    /// Get existing key pair without generating a new one.
+    /// Returns None if no key pair exists in cache or config file.
+    pub fn get_existing_key_pair() -> Option<KeyPair> {
+        let mut lock = KEY_PAIR.lock().unwrap();
+        if let Some(p) = lock.as_ref() {
+            return Some(p.clone());
+        }
+
+        // IMPORTANT: this path is called while holding KEY_PAIR lock.
+        // Config::load_ must remain a raw conf load/deserialize path and must never
+        // call decrypt_* / symmetric_crypt (directly or indirectly), otherwise this
+        // can re-enter key loading and deadlock.
+        let config = Config::load_::<Config>("");
+        if !config.key_pair.0.is_empty() {
+            *lock = Some(config.key_pair.clone());
+            Some(config.key_pair)
+        } else {
+            None
+        }
     }
 
     pub fn no_register_device() -> bool {
@@ -1218,38 +1374,135 @@ impl Config {
                 return;
             }
         }
+
         let mut config = CONFIG.write().unwrap();
-        if password == config.password {
+
+        let stored = if password.is_empty() {
+            String::new()
+        } else {
+            Self::compute_permanent_password_storage_for_update(&mut config, password)
+        };
+        if stored == config.password {
             return;
         }
-        config.password = password.into();
+        config.password = stored;
         config.store();
         Self::clear_trusted_devices();
     }
 
-    pub fn get_permanent_password() -> String {
-        let mut password = CONFIG.read().unwrap().password.clone();
-        if password.is_empty() {
-            if let Some(v) = HARD_SETTINGS.read().unwrap().get("password") {
-                password = v.to_owned();
-            }
+    fn compute_permanent_password_storage_for_update(
+        config: &mut Config,
+        password: &str,
+    ) -> String {
+        // Keep salt stable for user-initiated permanent password updates.
+        // Salt should only change when service->user sync updates storage and salt as a pair.
+        if config.salt.is_empty() {
+            config.salt = Config::get_auto_password(DEFAULT_SALT_LEN);
         }
-        password
+        let h1 = compute_permanent_password_h1(password, &config.salt);
+        encode_permanent_password_storage_from_h1(&h1)
     }
 
+    /// Returns the locally persisted permanent password storage and salt (NOT the hard/preset one).
+    ///
+    /// This function is side-effect free:
+    /// - It does NOT call `get_salt()` (which may auto-generate salt).
+    /// - It returns a consistent snapshot under a single lock.
+    pub fn get_local_permanent_password_storage_and_salt() -> (String, String) {
+        let config = CONFIG.read().unwrap();
+        (config.password.clone(), config.salt.clone())
+    }
+
+    /// Persist permanent password storage and salt from service->user config sync.
+    pub fn set_permanent_password_storage_for_sync(
+        storage: &str,
+        salt: &str,
+    ) -> crate::ResultType<bool> {
+        let mut config = CONFIG.write().unwrap();
+        if config.password == storage && config.salt == salt {
+            return Ok(false);
+        }
+
+        config.password = storage.to_owned();
+        config.salt = salt.to_owned();
+        config.store();
+        Self::clear_trusted_devices();
+        Ok(true)
+    }
+
+    /// Returns true if `input` (candidate plaintext) matches the currently effective permanent password.
+    pub fn matches_permanent_password_plain(input: &str) -> bool {
+        if input.is_empty() {
+            return false;
+        }
+
+        let config = CONFIG.read().unwrap();
+        let storage = config.password.clone();
+        let salt = config.salt.clone();
+        drop(config);
+
+        if storage.is_empty() {
+            return HARD_SETTINGS
+                .read()
+                .unwrap()
+                .get("password")
+                .map_or(false, |v| v == input);
+        }
+
+        if let Some(stored_h1) = decode_permanent_password_h1_from_storage(&storage) {
+            if salt.is_empty() {
+                log::error!("Salt is empty but permanent password is hashed");
+                return false;
+            }
+            let h1 = compute_permanent_password_h1(input, &salt);
+            return constant_time_eq_32(&h1, &stored_h1);
+        }
+
+        log::warn!("Permanent password storage is not hashed; verifying as plaintext");
+        storage == input
+    }
+
+    pub fn has_permanent_password() -> bool {
+        if !CONFIG.read().unwrap().password.is_empty() {
+            return true;
+        }
+        HARD_SETTINGS
+            .read()
+            .unwrap()
+            .get("password")
+            .map_or(false, |v| !v.is_empty())
+    }
+
+    pub fn has_local_permanent_password() -> bool {
+        !CONFIG.read().unwrap().password.is_empty()
+    }
+
+    // This shouldn't happen under normal circumstances because the salt
+    // should be automatically generated when migrating to hash storage.
+    // Actually, it is better to avoid calling set_salt at all.
     pub fn set_salt(salt: &str) {
         let mut config = CONFIG.write().unwrap();
         if salt == config.salt {
             return;
+        }
+        if !password_is_empty_or_not_hashed(&config.password) {
+            if config.salt.is_empty() {
+                log::warn!("Salt is empty but permanent password is hashed and salt is empty");
+            } else {
+                log::error!("Refusing to set salt because permanent password is hashed");
+                return;
+            }
         }
         config.salt = salt.into();
         config.store();
     }
 
     pub fn get_salt() -> String {
-        let mut salt = CONFIG.read().unwrap().salt.clone();
+        let config = CONFIG.read().unwrap();
+        let mut salt = config.salt.clone();
         if salt.is_empty() {
-            salt = Config::get_auto_password(6);
+            drop(config);
+            salt = Config::get_auto_password(DEFAULT_SALT_LEN);
             Config::set_salt(&salt);
         }
         salt
@@ -1436,6 +1689,8 @@ impl Config {
         return CONFIG.read().unwrap().clone();
     }
 
+    // TODO: `Config::set()` does not invalidate trusted devices when permanent password/salt changes.
+    // This matches historical behavior, but may need revisiting in a separate PR.
     pub fn set(cfg: Config) -> bool {
         let mut lock = CONFIG.write().unwrap();
         if *lock == cfg {
@@ -1443,7 +1698,29 @@ impl Config {
         }
         *lock = cfg;
         lock.store();
+        // Drop CONFIG lock before acquiring KEY_PAIR lock to avoid potential deadlock.
+        #[cfg(target_os = "macos")]
+        let new_key_pair = lock.key_pair.clone();
+        drop(lock);
+        #[cfg(target_os = "macos")]
+        Self::invalidate_key_pair_cache_if_changed(&new_key_pair);
         true
+    }
+
+    /// Invalidate KEY_PAIR cache if it differs from the new key_pair.
+    /// Use None to invalidate the cache instead of Some(key_pair).
+    /// If we use Some with an empty key_pair, get_key_pair() would always return
+    /// the empty key_pair from cache without regenerating.
+    /// By clearing the cache, get_key_pair() will reload and regenerate if needed.
+    #[cfg(target_os = "macos")]
+    fn invalidate_key_pair_cache_if_changed(new_key_pair: &KeyPair) {
+        let mut key_pair_cache = KEY_PAIR.lock().unwrap();
+        if let Some(cached) = key_pair_cache.as_ref() {
+            if cached != new_key_pair {
+                *key_pair_cache = None;
+                log::info!("key pair cache invalidated");
+            }
+        }
     }
 
     fn with_extension(path: PathBuf) -> PathBuf {
@@ -2389,6 +2666,12 @@ pub struct GroupUser {
         skip_serializing_if = "String::is_empty"
     )]
     pub name: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub display_name: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -2659,6 +2942,8 @@ pub mod keys {
     pub const OPTION_ENABLE_REMOTE_RESTART: &str = "enable-remote-restart";
     pub const OPTION_ENABLE_RECORD_SESSION: &str = "enable-record-session";
     pub const OPTION_ENABLE_BLOCK_INPUT: &str = "enable-block-input";
+    pub const OPTION_ENABLE_PRIVACY_MODE: &str = "enable-privacy-mode";
+    pub const OPTION_ENABLE_PERM_CHANGE_IN_ACCEPT_WINDOW: &str = "enable-perm-change-in-accept-window";
     pub const OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION: &str = "allow-remote-config-modification";
     pub const OPTION_ALLOW_NUMERNIC_ONE_TIME_PASSWORD: &str = "allow-numeric-one-time-password";
     pub const OPTION_ENABLE_LAN_DISCOVERY: &str = "enable-lan-discovery";
@@ -2721,6 +3006,7 @@ pub mod keys {
 
     // built-in options
     pub const OPTION_DISPLAY_NAME: &str = "display-name";
+    pub const OPTION_AVATAR: &str = "avatar";
     pub const OPTION_PRESET_DEVICE_GROUP_NAME: &str = "preset-device-group-name";
     pub const OPTION_PRESET_USERNAME: &str = "preset-user-name";
     pub const OPTION_PRESET_STRATEGY_NAME: &str = "preset-strategy-name";
@@ -2731,6 +3017,7 @@ pub mod keys {
     pub const OPTION_HIDE_PROXY_SETTINGS: &str = "hide-proxy-settings";
     pub const OPTION_HIDE_REMOTE_PRINTER_SETTINGS: &str = "hide-remote-printer-settings";
     pub const OPTION_HIDE_WEBSOCKET_SETTINGS: &str = "hide-websocket-settings";
+    pub const OPTION_HIDE_STOP_SERVICE: &str = "hide-stop-service";
 
     // Connection punch-through options
     pub const OPTION_ENABLE_UDP_PUNCH: &str = "enable-udp-punch";
@@ -2741,8 +3028,11 @@ pub mod keys {
     pub const OPTION_HIDE_TRAY: &str = "hide-tray";
     pub const OPTION_ONE_WAY_CLIPBOARD_REDIRECTION: &str = "one-way-clipboard-redirection";
     pub const OPTION_ALLOW_LOGON_SCREEN_PASSWORD: &str = "allow-logon-screen-password";
+    pub const OPTION_ALLOW_DEEP_LINK_PASSWORD: &str = "allow-deep-link-password";
+    pub const OPTION_ALLOW_DEEP_LINK_SERVER_SETTINGS: &str = "allow-deep-link-server-settings";
     pub const OPTION_ONE_WAY_FILE_TRANSFER: &str = "one-way-file-transfer";
     pub const OPTION_ALLOW_HTTPS_21114: &str = "allow-https-21114";
+    pub const OPTION_USE_RAW_TCP_FOR_API: &str = "use-raw-tcp-for-api";
     pub const OPTION_ALLOW_HOSTNAME_AS_ID: &str = "allow-hostname-as-id";
     pub const OPTION_HIDE_POWERED_BY_ME: &str = "hide-powered-by-me";
     pub const OPTION_MAIN_WINDOW_ALWAYS_ON_TOP: &str = "main-window-always-on-top";
@@ -2775,10 +3065,12 @@ pub mod keys {
     pub const OPTION_KEEP_SCREEN_ON: &str = "keep-screen-on";
 
     // Server-side: keep host system awake during incoming sessions (Security setting)
-    pub const OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS: &str = "keep-awake-during-incoming-sessions";
+    pub const OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS: &str =
+        "keep-awake-during-incoming-sessions";
 
-    // Client-side: keep client system awake during outgoing sessions (General setting)  
-    pub const OPTION_KEEP_AWAKE_DURING_OUTGOING_SESSIONS: &str = "keep-awake-during-outgoing-sessions";
+    // Client-side: keep client system awake during outgoing sessions (General setting)
+    pub const OPTION_KEEP_AWAKE_DURING_OUTGOING_SESSIONS: &str =
+        "keep-awake-during-outgoing-sessions";
 
     pub const OPTION_DISABLE_GROUP_PANEL: &str = "disable-group-panel";
     pub const OPTION_DISABLE_DISCOVERY_PANEL: &str = "disable-discovery-panel";
@@ -2880,6 +3172,7 @@ pub mod keys {
         OPTION_ENABLE_REMOTE_RESTART,
         OPTION_ENABLE_RECORD_SESSION,
         OPTION_ENABLE_BLOCK_INPUT,
+        OPTION_ENABLE_PRIVACY_MODE,
         OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION,
         OPTION_ALLOW_NUMERNIC_ONE_TIME_PASSWORD,
         OPTION_ENABLE_LAN_DISCOVERY,
@@ -2921,11 +3214,13 @@ pub mod keys {
         OPTION_DISABLE_UDP,
         OPTION_ALLOW_INSECURE_TLS_FALLBACK,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
+        OPTION_ALLOW_AUTO_UPDATE,
     ];
 
     // BUILDIN_SETTINGS
     pub const KEYS_BUILDIN_SETTINGS: &[&str] = &[
         OPTION_DISPLAY_NAME,
+        OPTION_AVATAR,
         OPTION_PRESET_DEVICE_GROUP_NAME,
         OPTION_PRESET_USERNAME,
         OPTION_PRESET_STRATEGY_NAME,
@@ -2936,12 +3231,15 @@ pub mod keys {
         OPTION_HIDE_PROXY_SETTINGS,
         OPTION_HIDE_REMOTE_PRINTER_SETTINGS,
         OPTION_HIDE_WEBSOCKET_SETTINGS,
+        OPTION_HIDE_STOP_SERVICE,
         OPTION_HIDE_USERNAME_ON_CARD,
         OPTION_HIDE_HELP_CARDS,
         OPTION_DEFAULT_CONNECT_PASSWORD,
         OPTION_HIDE_TRAY,
         OPTION_ONE_WAY_CLIPBOARD_REDIRECTION,
         OPTION_ALLOW_LOGON_SCREEN_PASSWORD,
+        OPTION_ALLOW_DEEP_LINK_PASSWORD,
+        OPTION_ALLOW_DEEP_LINK_SERVER_SETTINGS,
         OPTION_ONE_WAY_FILE_TRANSFER,
         OPTION_ALLOW_HTTPS_21114,
         OPTION_ALLOW_HOSTNAME_AS_ID,
@@ -2952,6 +3250,8 @@ pub mod keys {
         OPTION_DISABLE_CHANGE_PERMANENT_PASSWORD,
         OPTION_DISABLE_CHANGE_ID,
         OPTION_DISABLE_UNLOCK_PIN,
+        OPTION_USE_RAW_TCP_FOR_API,
+        OPTION_ENABLE_PERM_CHANGE_IN_ACCEPT_WINDOW,
     ];
 }
 
@@ -3015,6 +3315,48 @@ mod tests {
         let cfg: PeerConfig = Default::default();
         let res = toml::to_string_pretty(&cfg);
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_permanent_password_h1_storage_roundtrip() {
+        let salt = "salt123";
+        let password = "p@ssw0rd";
+        let h1 = compute_permanent_password_h1(password, salt);
+        let stored = encode_permanent_password_storage_from_h1(&h1);
+        assert!(stored.starts_with(PERMANENT_PASSWORD_HASH_PREFIX));
+        assert!(is_permanent_password_hashed_storage(&stored));
+        let decoded = decode_permanent_password_h1_from_storage(&stored).unwrap();
+        assert_eq!(&decoded[..], &h1[..]);
+    }
+
+    #[test]
+    fn test_migrate_plaintext_permanent_password_to_hashed_storage() {
+        let mut cfg = Config::default();
+        cfg.password = "p@ssw0rd".to_owned();
+        cfg.salt = "".to_owned();
+        let changed = Config::migrate_permanent_password_to_hashed_storage(&mut cfg);
+        assert!(changed);
+        assert!(is_permanent_password_hashed_storage(&cfg.password));
+        assert_eq!(cfg.salt.chars().count(), DEFAULT_SALT_LEN);
+
+        let stored_h1 = decode_permanent_password_h1_from_storage(&cfg.password).unwrap();
+        let expected_h1 = compute_permanent_password_h1("p@ssw0rd", &cfg.salt);
+        assert_eq!(stored_h1, expected_h1);
+    }
+
+    #[test]
+    fn test_migrate_plaintext_with_00_prefix_permanent_password_to_hashed_storage() {
+        let mut cfg = Config::default();
+        cfg.password = "00secret".to_owned();
+        cfg.salt = "".to_owned();
+        let changed = Config::migrate_permanent_password_to_hashed_storage(&mut cfg);
+        assert!(changed);
+        assert!(is_permanent_password_hashed_storage(&cfg.password));
+        assert!(!cfg.salt.is_empty());
+
+        let stored_h1 = decode_permanent_password_h1_from_storage(&cfg.password).unwrap();
+        let expected_h1 = compute_permanent_password_h1("00secret", &cfg.salt);
+        assert_eq!(stored_h1, expected_h1);
     }
 
     #[test]
@@ -3269,5 +3611,27 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_uinput_ipc_path_is_shared_across_uids() {
+        const ROOT_UID: u32 = 0;
+        const USER_UID: u32 = 1000;
+
+        let path_root = Config::ipc_path_for_uid(ROOT_UID, "_uinput_keyboard");
+        let path_user = Config::ipc_path_for_uid(USER_UID, "_uinput_keyboard");
+        assert_eq!(path_root, path_user);
+
+        let app_name = APP_NAME.read().unwrap().clone();
+        assert!(
+            path_root.starts_with(&format!("/tmp/{app_name}-service/")),
+            "unexpected uinput ipc path: {}",
+            path_root
+        );
+
+        let non_service_root = Config::ipc_path_for_uid(ROOT_UID, "");
+        let non_service_user = Config::ipc_path_for_uid(USER_UID, "");
+        assert_ne!(non_service_root, non_service_user);
     }
 }
